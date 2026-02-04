@@ -27,10 +27,6 @@ self.addEventListener('install', event => {
                     new Request(url, { cache: 'reload' })
                 ));
             })
-            .then(() => {
-                // Force the waiting service worker to become the active service worker
-                return self.skipWaiting();
-            })
             .catch(error => {
                 console.error('Service Worker installation failed:', error);
             })
@@ -151,6 +147,7 @@ self.addEventListener('fetch', event => {
 // ============================================================================
 self.addEventListener('message', event => {
     if (event.data.type === 'SKIP_WAITING') {
+        // User clicked "Update Now" - activate the new service worker
         self.skipWaiting();
     }
 
