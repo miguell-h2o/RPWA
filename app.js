@@ -245,7 +245,7 @@
         ).join('');
     }
 
-    function addSubreddit() {
+    async function addSubreddit() {
         const input = document.getElementById('subredditInput');
         const sub = input.value.trim().replace(/^r\//, '');
         
@@ -262,7 +262,10 @@
         safeSetItem('subreddits', subreddits);
         input.value = '';
         renderSubreddits();
-        fetchPosts();
+        
+        // Fetch posts only from the newly added subreddit
+        await fetchPostsFromSubreddit(sub);
+        
         toggleSidebar();
     }
 
@@ -452,6 +455,39 @@
             return;
         }
         fetchPosts();
+    }
+
+    async function fetchPostsFromSubreddit(subreddit) {
+        if (!navigator.onLine) {
+            alert('You are offline. Cannot fetch posts.');
+            return;
+        }
+
+        const loading = document.getElementById('loading');
+        const status = document.getElementById('status');
+        
+        loading.classList.add('active');
+        status.textContent = `Fetching posts from r/${subreddit}...`;
+
+        try {
+            const posts = await fetchSubredditPosts(subreddit);
+            
+            if (posts.length > 0) {
+                // Merge new posts with existing cached posts
+                const allPosts = [...cachedPosts, ...posts];
+                const uniquePosts = removeDuplicatePosts(allPosts);
+                cachedPosts = uniquePosts.sort((a, b) => b.created_utc - a.created_utc);
+                safeSetItem('cachedPosts', cachedPosts);
+            }
+            
+            status.textContent = '';
+        } catch (error) {
+            status.textContent = `Failed to fetch r/${subreddit}: ${error.message}`;
+            console.error(error);
+        }
+
+        loading.classList.remove('active');
+        renderPosts();
     }
 
     // ============================================================================

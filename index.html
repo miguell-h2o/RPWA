@@ -278,7 +278,7 @@
 
         .offline-banner {
             position: fixed;
-            top: 48px;
+            top: 0;
             left: 0;
             right: 0;
             background: #f44336;
@@ -286,8 +286,21 @@
             padding: 8px 16px;
             text-align: center;
             font-size: 14px;
-            z-index: 99;
+            z-index: 101;
             display: none;
+        }
+
+        .offline-banner.active + .update-notification,
+        .offline-banner.active ~ .header {
+            margin-top: 40px;
+        }
+
+        .update-notification.active ~ .header {
+            margin-top: 56px;
+        }
+
+        .offline-banner.active + .update-notification.active ~ .header {
+            margin-top: 96px;
         }
 
         .offline-banner.active {
@@ -296,13 +309,13 @@
 
         .update-notification {
             position: fixed;
-            top: 48px;
+            top: 0;
             left: 0;
             right: 0;
             background: #ff4500;
             color: white;
             padding: 12px 16px;
-            z-index: 1000;
+            z-index: 1001;
             display: none;
             justify-content: space-between;
             align-items: center;
