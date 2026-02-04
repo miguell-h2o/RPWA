@@ -1,9 +1,7 @@
 // Reddit PWA Service Worker
-// Version: 1.0.0
 
-const CACHE_VERSION = 'reddit-pwa-v1.0.0';
-const CACHE_NAME = `app-shell-${CACHE_VERSION}`;
-const RUNTIME_CACHE = `runtime-${CACHE_VERSION}`;
+const CACHE_NAME = 'reddit-pwa-app-shell';
+const RUNTIME_CACHE = 'reddit-pwa-runtime';
 
 // Files to cache for offline functionality
 const APP_SHELL_FILES = [
@@ -24,7 +22,10 @@ self.addEventListener('install', event => {
     event.waitUntil(
         caches.open(CACHE_NAME)
             .then(cache => {
-                return cache.addAll(APP_SHELL_FILES);
+                // Force network fetch to bypass cache and get latest files
+                return cache.addAll(APP_SHELL_FILES.map(url => 
+                    new Request(url, { cache: 'reload' })
+                ));
             })
             .then(() => {
                 // Force the waiting service worker to become the active service worker
@@ -37,25 +38,11 @@ self.addEventListener('install', event => {
 });
 
 // ============================================================================
-// ACTIVATE EVENT - Clean up old caches
+// ACTIVATE EVENT - Take control immediately
 // ============================================================================
 self.addEventListener('activate', event => {
     event.waitUntil(
-        caches.keys()
-            .then(cacheNames => {
-                return Promise.all(
-                    cacheNames.map(cacheName => {
-                        // Delete old caches
-                        if (cacheName !== CACHE_NAME && cacheName !== RUNTIME_CACHE) {
-                            return caches.delete(cacheName);
-                        }
-                    })
-                );
-            })
-            .then(() => {
-                // Take control of all clients immediately
-                return self.clients.claim();
-            })
+        self.clients.claim()
     );
 });
 
