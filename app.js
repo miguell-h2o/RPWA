@@ -13,7 +13,7 @@
         MAX_RETRIES: 3,
         INITIAL_BACKOFF: 1000,
         MAX_BACKOFF: 30000,
-        POSTS_LIMIT: 100,
+        POSTS_LIMIT: 25,
         UPDATE_CHECK_INTERVAL: 5 * 60 * 1000, // 5 minutes
         RATE_LIMIT_RESET_INTERVAL: 60 * 1000 // 1 minute
     };
@@ -95,30 +95,45 @@
     // ============================================================================
     function setupEventListeners() {
         // Menu and sidebar
-        document.getElementById('menuBtn').addEventListener('click', toggleSidebar);
-        document.getElementById('closeSidebar').addEventListener('click', toggleSidebar);
-        document.getElementById('overlay').addEventListener('click', toggleSidebar);
+        const menuBtn = document.getElementById('menuBtn');
+        const closeSidebar = document.getElementById('closeSidebar');
+        const overlay = document.getElementById('overlay');
+        const addSubredditBtn = document.getElementById('addSubredditBtn');
+        const subredditInput = document.getElementById('subredditInput');
+        const refreshPostsBtn = document.getElementById('refreshPostsBtn');
+        const exportBtn = document.getElementById('exportBtn');
+        const importBtn = document.getElementById('importBtn');
+        const importFile = document.getElementById('importFile');
+        const updateButton = document.getElementById('updateButton');
+
+        if (menuBtn) menuBtn.addEventListener('click', toggleSidebar);
+        if (closeSidebar) closeSidebar.addEventListener('click', toggleSidebar);
+        if (overlay) overlay.addEventListener('click', toggleSidebar);
 
         // Subreddit management
-        document.getElementById('addSubredditBtn').addEventListener('click', addSubreddit);
-        document.getElementById('subredditInput').addEventListener('keypress', function(e) {
-            if (e.key === 'Enter') {
-                addSubreddit();
-            }
-        });
+        if (addSubredditBtn) addSubredditBtn.addEventListener('click', addSubreddit);
+        if (subredditInput) {
+            subredditInput.addEventListener('keypress', function(e) {
+                if (e.key === 'Enter') {
+                    addSubreddit();
+                }
+            });
+        }
 
         // Refresh posts
-        document.getElementById('refreshPostsBtn').addEventListener('click', refreshPosts);
+        if (refreshPostsBtn) refreshPostsBtn.addEventListener('click', refreshPosts);
 
         // Export/Import
-        document.getElementById('exportBtn').addEventListener('click', exportSubreddits);
-        document.getElementById('importBtn').addEventListener('click', () => {
-            document.getElementById('importFile').click();
-        });
-        document.getElementById('importFile').addEventListener('change', importSubreddits);
+        if (exportBtn) exportBtn.addEventListener('click', exportSubreddits);
+        if (importBtn) {
+            importBtn.addEventListener('click', () => {
+                if (importFile) importFile.click();
+            });
+        }
+        if (importFile) importFile.addEventListener('change', importSubreddits);
 
         // Update button
-        document.getElementById('updateButton').addEventListener('click', updatePWA);
+        if (updateButton) updateButton.addEventListener('click', updatePWA);
     }
 
     // ============================================================================
@@ -390,7 +405,7 @@
             }
 
             const data = await response.json();
-            const posts = data.data.children.map(child => child.data);
+            const posts = data.data.children.map(child => stripPostData(child.data));
 
             safeSetItem('rateLimitState', rateLimitState);
             updateAllDisplays();
@@ -457,6 +472,28 @@
             seen.add(post.id);
             return true;
         });
+    }
+
+    function stripPostData(post) {
+        // Keep only essential fields to save storage space
+        return {
+            id: post.id,
+            title: post.title,
+            author: post.author,
+            subreddit: post.subreddit,
+            permalink: post.permalink,
+            created_utc: post.created_utc,
+            ups: post.ups,
+            num_comments: post.num_comments,
+            selftext: post.selftext ? post.selftext.substring(0, 500) : '', // Limit selftext
+            preview: post.preview?.images?.[0]?.source?.url ? {
+                images: [{
+                    source: {
+                        url: post.preview.images[0].source.url
+                    }
+                }]
+            } : null
+        };
     }
 
     function updateLoadingStatus(message) {
