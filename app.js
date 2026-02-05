@@ -431,24 +431,26 @@
         loading.classList.add('active');
         status.textContent = 'Fetching posts...';
 
-        const allPosts = [];
         const errors = [];
 
         for (const sub of subreddits) {
             try {
                 updateLoadingStatus(`Fetching r/${sub}...`);
                 const posts = await fetchSubredditPosts(sub);
-                allPosts.push(...posts);
+                
+                if (posts.length > 0) {
+                    // Immediately merge and display posts from this subreddit
+                    const allPosts = [...cachedPosts, ...posts];
+                    const uniquePosts = removeDuplicatePosts(allPosts);
+                    cachedPosts = uniquePosts.sort((a, b) => b.created_utc - a.created_utc);
+                    safeSetItem('cachedPosts', cachedPosts);
+                    
+                    // Render posts immediately after each fetch
+                    renderPosts();
+                }
             } catch (error) {
                 errors.push(`r/${sub}: ${error.message}`);
             }
-        }
-
-        if (allPosts.length > 0) {
-            // Sort by newest first and remove duplicates
-            const uniquePosts = removeDuplicatePosts(allPosts);
-            cachedPosts = uniquePosts.sort((a, b) => b.created_utc - a.created_utc);
-            safeSetItem('cachedPosts', cachedPosts);
         }
 
         loading.classList.remove('active');
@@ -459,8 +461,6 @@
         } else {
             status.textContent = '';
         }
-
-        renderPosts();
     }
 
     function removeDuplicatePosts(posts) {
