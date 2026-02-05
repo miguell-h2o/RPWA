@@ -1,0 +1,13 @@
+{
+  "countries": [
+    {
+      "name": "Portugal",
+      "code": "PT",
+      "subreddits": [
+        "portugal",
+        "portugueses",
+        "LusoMeteo"
+      ]
+    }
+  ]
+}

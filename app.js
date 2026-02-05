@@ -29,6 +29,8 @@
         resetTime: Date.now() + CONFIG.RATE_LIMIT_RESET_INTERVAL,
         requestCount: 0
     };
+    let countrySuggestions = [];
+    let selectedCountry = null;
 
     // ============================================================================
     // LOCAL STORAGE HELPERS (with error handling)
@@ -59,7 +61,7 @@
     // ============================================================================
     // INITIALIZATION
     // ============================================================================
-    function initializeApp() {
+    async function initializeApp() {
         // Load data from localStorage
         subreddits = safeGetItem('subreddits', []);
         cachedPosts = safeGetItem('cachedPosts', []);
@@ -69,16 +71,23 @@
             rateLimitState = { ...rateLimitState, ...savedRateLimitState };
         }
 
+        // Load country suggestions first
+        await loadCountrySuggestions();
+
         // Set up event listeners
         setupEventListeners();
 
         // Register service worker
         registerServiceWorker();
 
-        // Initial render
-        renderSubreddits();
-        renderPosts();
-        updateAllDisplays();
+        // Show welcome screen if no subreddits, otherwise render
+        if (subreddits.length === 0) {
+            showWelcomeScreen();
+        } else {
+            renderSubreddits();
+            renderPosts();
+            updateAllDisplays();
+        }
 
         // Set up periodic tasks
         setupPeriodicTasks();
@@ -134,6 +143,12 @@
 
         // Update button
         if (updateButton) updateButton.addEventListener('click', updatePWA);
+
+        // Welcome screen
+        const skipWelcome = document.getElementById('skipWelcome');
+        const addDefaults = document.getElementById('addDefaults');
+        if (skipWelcome) skipWelcome.addEventListener('click', hideWelcomeScreen);
+        if (addDefaults) addDefaults.addEventListener('click', addDefaultSubreddits);
     }
 
     // ============================================================================
@@ -765,6 +780,81 @@
             }
         };
         reader.readAsText(file);
+    }
+
+    // ============================================================================
+    // WELCOME SCREEN & COUNTRY SUGGESTIONS
+    // ============================================================================
+    async function loadCountrySuggestions() {
+        try {
+            const response = await fetch('./subreddit-suggestions.json');
+            const data = await response.json();
+            countrySuggestions = data.countries;
+        } catch (error) {
+            console.error('Error loading country suggestions:', error);
+            countrySuggestions = [];
+        }
+    }
+
+    function showWelcomeScreen() {
+        const welcomeScreen = document.getElementById('welcomeScreen');
+        const countryList = document.getElementById('countryList');
+        
+        if (!welcomeScreen || !countryList) return;
+
+        // Render country options
+        countryList.innerHTML = countrySuggestions.map((country, index) => `
+            <div class="country-option" data-index="${index}">
+                <div class="country-option-name">${country.name}</div>
+                <div class="country-option-subs">${country.subreddits.join(', ')}</div>
+            </div>
+        `).join('');
+
+        // Add click handlers to country options
+        countryList.querySelectorAll('.country-option').forEach(option => {
+            option.addEventListener('click', () => selectCountry(option));
+        });
+
+        welcomeScreen.classList.add('active');
+    }
+
+    function selectCountry(optionElement) {
+        // Remove selection from all options
+        document.querySelectorAll('.country-option').forEach(opt => {
+            opt.classList.remove('selected');
+        });
+
+        // Select clicked option
+        optionElement.classList.add('selected');
+        selectedCountry = parseInt(optionElement.dataset.index);
+
+        // Enable add defaults button
+        const addDefaultsBtn = document.getElementById('addDefaults');
+        if (addDefaultsBtn) addDefaultsBtn.disabled = false;
+    }
+
+    function addDefaultSubreddits() {
+        if (selectedCountry === null || !countrySuggestions[selectedCountry]) return;
+
+        const defaultSubs = countrySuggestions[selectedCountry].subreddits;
+        subreddits = [...defaultSubs];
+        safeSetItem('subreddits', subreddits);
+
+        hideWelcomeScreen();
+        renderSubreddits();
+        fetchPosts();
+    }
+
+    function hideWelcomeScreen() {
+        const welcomeScreen = document.getElementById('welcomeScreen');
+        if (welcomeScreen) {
+            welcomeScreen.classList.remove('active');
+        }
+        
+        // If still no subreddits after skip, render the empty state
+        renderSubreddits();
+        renderPosts();
+        updateAllDisplays();
     }
 
     // ============================================================================
