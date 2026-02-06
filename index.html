@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta name="theme-color" content="#ff4500">
-    <title>Reddit PWA</title>
+    <title>Emergency News PWA</title>
     <link rel="manifest" href="./manifest.json">
     <style>
         * {
@@ -283,10 +283,15 @@
         .feed-tabs {
             display: flex;
             background: white;
-            margin: 0 16px 10px;
+            margin: 4px 16px 10px;
             border-radius: 4px;
             overflow: hidden;
             box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+        }
+
+        .offline-banner.active ~ .feed-tabs,
+        .update-notification.active ~ .feed-tabs {
+            margin-top: 10px;
         }
 
         .feed-tab {
@@ -493,7 +498,7 @@
 <body>
     <div class="welcome-screen" id="welcomeScreen">
         <div class="welcome-content">
-            <h2>Welcome to Reddit PWA</h2>
+            <h2>Emergency News PWA</h2>
             <p>Select your country to get started with suggested subreddits</p>
             <div class="country-list" id="countryList"></div>
             <div class="welcome-actions">
@@ -520,10 +525,10 @@
             <button class="close-btn" id="closeSidebar">×</button>
         </div>
         <div class="sidebar-content">
+            <button id="refreshPostsBtn" style="width: 100%; margin-bottom: 16px; background: #ff4500;">Refresh Posts</button>
             <input type="text" id="subredditInput" placeholder="Enter subreddit name" />
             <div class="button-row">
                 <button id="addSubredditBtn">Add Subreddit</button>
-                <button id="refreshPostsBtn">Refresh Posts</button>
             </div>
             <div class="subreddit-list" id="subredditList"></div>
             
@@ -544,7 +549,7 @@
     <div class="header">
         <div class="header-left">
             <button class="menu-btn" id="menuBtn">☰</button>
-            <h1>Reddit PWA</h1>
+            <h1>ENP</h1>
             <span class="rate-limit-info" id="rateLimitInfo"></span>
         </div>
         <div class="status-dot" id="statusDot"></div>

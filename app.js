@@ -67,6 +67,7 @@
         subreddits = safeGetItem('subreddits', []);
         cachedPosts = safeGetItem('cachedPosts', []);
         popularPosts = safeGetItem('popularPosts', []);
+        currentFeed = safeGetItem('currentFeed', 'my');
         const savedRateLimitState = safeGetItem('rateLimitState', null);
         
         if (savedRateLimitState) {
@@ -90,7 +91,7 @@
             showWelcomeScreen();
         } else {
             renderSubreddits();
-            renderPosts();
+            switchFeed(currentFeed); // Restore saved feed
             updateAllDisplays();
         }
 
@@ -303,6 +304,7 @@
 
     function switchFeed(feed) {
         currentFeed = feed;
+        safeSetItem('currentFeed', currentFeed);
 
         // Update tab active states
         const myFeedTab = document.getElementById('myFeedTab');
@@ -398,6 +400,7 @@
         cachedPosts = cachedPosts.filter(post => post.subreddit !== sub);
         safeSetItem('cachedPosts', cachedPosts);
         
+        updateFeedTabsVisibility();
         renderSubreddits();
         renderPosts();
     }
@@ -602,7 +605,13 @@
             return;
         }
         toggleSidebar(); // Close sidebar
-        fetchPosts();
+        
+        // Refresh current feed
+        if (currentFeed === 'my') {
+            fetchPosts();
+        } else {
+            fetchPopularPosts();
+        }
     }
 
     async function fetchPostsFromSubreddit(subreddit) {
@@ -850,13 +859,18 @@
                     return;
                 }
 
+                const beforeCount = subreddits.length;
+                
                 // Merge with existing subreddits (avoid duplicates)
                 const merged = [...new Set([...subreddits, ...data.subreddits])];
                 subreddits = merged;
                 safeSetItem('subreddits', subreddits);
                 
+                const newCount = merged.length - beforeCount;
+                
                 renderSubreddits();
-                alert(`Imported ${data.subreddits.length} subreddits (${merged.length - subreddits.length} new)`);
+                updateFeedTabsVisibility();
+                alert(`Imported ${data.subreddits.length} subreddits (${newCount} new)`);
                 
                 // Clear file input
                 event.target.value = '';

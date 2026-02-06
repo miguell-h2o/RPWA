@@ -1,7 +1,7 @@
 {
-  "name": "Reddit PWA",
-  "short_name": "Reddit",
-  "description": "Offline Reddit post viewer",
+  "name": "Emergency News PWA",
+  "short_name": "ENP",
+  "description": "Emergency offline news viewer",
   "start_url": "./index.html",
   "scope": "./",
   "display": "standalone",
