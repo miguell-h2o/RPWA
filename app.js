@@ -321,8 +321,19 @@
         if (currentFeed === 'my' && subreddits.length > 0) {
             filterBar.classList.add('active');
             
+            // Only show filters for subreddits that have posts
+            const subsWithPosts = [...new Set(cachedPosts.map(p => p.subreddit))];
+            const availableSubs = subreddits.filter(sub => 
+                subsWithPosts.some(s => s.toLowerCase() === sub.toLowerCase())
+            );
+            
+            if (availableSubs.length === 0) {
+                filterBar.classList.remove('active');
+                return;
+            }
+            
             const chips = ['<span class="filter-chip active" data-filter="all">All</span>'];
-            subreddits.forEach(sub => {
+            availableSubs.forEach(sub => {
                 chips.push(`<span class="filter-chip" data-filter="${sub}">r/${sub}</span>`);
             });
             
@@ -554,15 +565,23 @@
     }
 
     function removeSubreddit(sub) {
-        subreddits = subreddits.filter(s => s !== sub);
+        subreddits = subreddits.filter(s => s.toLowerCase() !== sub.toLowerCase());
         safeSetItem('subreddits', subreddits);
         
-        // Remove posts from this subreddit
-        cachedPosts = cachedPosts.filter(post => post.subreddit !== sub);
+        // Remove posts from this subreddit (case insensitive)
+        cachedPosts = cachedPosts.filter(post => 
+            post.subreddit.toLowerCase() !== sub.toLowerCase()
+        );
         safeSetItem('cachedPosts', cachedPosts);
+        
+        // Reset filter if we're filtering by the removed subreddit
+        if (activeFilter.toLowerCase() === sub.toLowerCase()) {
+            activeFilter = 'all';
+        }
         
         updateFeedTabsVisibility();
         renderSubreddits();
+        renderSubredditFilter();
         renderPosts();
     }
 
@@ -813,26 +832,28 @@
 
         let postsToShow = currentFeed === 'my' ? cachedPosts : popularPosts;
 
-        // Filter by active subreddit filter (My Feed only)
+        // Filter by active subreddit filter (My Feed only) - case insensitive
         if (currentFeed === 'my' && activeFilter !== 'all') {
-            postsToShow = postsToShow.filter(post => post.subreddit === activeFilter);
+            postsToShow = postsToShow.filter(post => 
+                post.subreddit.toLowerCase() === activeFilter.toLowerCase()
+            );
         }
 
         // Filter out blocked subreddits (Popular feed only)
         if (currentFeed === 'popular') {
-            postsToShow = postsToShow.filter(post => !blockedSubreddits.includes(post.subreddit));
+            postsToShow = postsToShow.filter(post => 
+                !blockedSubreddits.some(blocked => 
+                    blocked.toLowerCase() === post.subreddit.toLowerCase()
+                )
+            );
         }
 
         if (postsToShow.length === 0) {
             container.innerHTML = '';
             if (currentFeed === 'my') {
-                if (activeFilter !== 'all') {
-                    status.textContent = `No posts from r/${activeFilter}`;
-                } else {
-                    status.textContent = navigator.onLine ? 
-                        'No posts yet. Add subreddits and click "Refresh Posts".' : 
-                        'No cached posts available. Connect to internet and refresh.';
-                }
+                status.textContent = navigator.onLine ? 
+                    'No posts yet. Add subreddits and click "Refresh Posts".' : 
+                    'No cached posts available. Connect to internet and refresh.';
             } else {
                 status.textContent = navigator.onLine ? 
                     'No popular posts yet. They will load automatically.' : 
@@ -1041,16 +1062,29 @@
 
                 const beforeCount = subreddits.length;
                 
-                // Merge with existing subreddits (avoid duplicates)
-                const merged = [...new Set([...subreddits, ...data.subreddits])];
-                subreddits = merged;
+                // Normalize to lowercase for comparison
+                const normalizedExisting = subreddits.map(s => s.toLowerCase());
+                const newSubs = data.subreddits.filter(sub => 
+                    !normalizedExisting.includes(sub.toLowerCase())
+                );
+                
+                // Add new subreddits
+                subreddits = [...subreddits, ...newSubs];
                 safeSetItem('subreddits', subreddits);
                 
-                const newCount = merged.length - beforeCount;
+                const newCount = newSubs.length;
                 
                 renderSubreddits();
+                renderSubredditFilter();
                 updateFeedTabsVisibility();
+                
                 alert(`Imported ${data.subreddits.length} subreddits (${newCount} new)`);
+                
+                // Close sidebar and fetch new posts if any were added
+                if (newCount > 0) {
+                    toggleSidebar();
+                    fetchPosts();
+                }
                 
                 // Clear file input
                 event.target.value = '';
