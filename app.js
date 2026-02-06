@@ -1,4 +1,4 @@
-// Reddit PWA - Main Application Logic
+// Emergency News PWA - Main Application Logic
 
 (function() {
     'use strict';
