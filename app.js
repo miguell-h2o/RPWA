@@ -512,6 +512,45 @@
     window.openSubredditPopup = openSubredditPopup;
     window.unblockSubreddit = unblockSubreddit;
 
+    // Gallery navigation functions
+    window.setGalleryImage = function(galleryId, index) {
+        const gallery = document.getElementById(galleryId);
+        if (!gallery) return;
+        
+        const images = gallery.querySelectorAll('.post-gallery-image');
+        const dots = gallery.querySelectorAll('.gallery-dot');
+        
+        images.forEach((img, i) => {
+            img.classList.toggle('active', i === index);
+        });
+        
+        dots.forEach((dot, i) => {
+            dot.classList.toggle('active', i === index);
+        });
+    };
+
+    window.nextGalleryImage = function(galleryId) {
+        const gallery = document.getElementById(galleryId);
+        if (!gallery) return;
+        
+        const images = gallery.querySelectorAll('.post-gallery-image');
+        let currentIndex = Array.from(images).findIndex(img => img.classList.contains('active'));
+        let nextIndex = (currentIndex + 1) % images.length;
+        
+        window.setGalleryImage(galleryId, nextIndex);
+    };
+
+    window.prevGalleryImage = function(galleryId) {
+        const gallery = document.getElementById(galleryId);
+        if (!gallery) return;
+        
+        const images = gallery.querySelectorAll('.post-gallery-image');
+        let currentIndex = Array.from(images).findIndex(img => img.classList.contains('active'));
+        let prevIndex = (currentIndex - 1 + images.length) % images.length;
+        
+        window.setGalleryImage(galleryId, prevIndex);
+    };
+
     // ============================================================================
     // FEED SWITCHING
     // ============================================================================
@@ -823,17 +862,26 @@
             created_utc: post.created_utc,
             ups: post.ups,
             num_comments: post.num_comments,
-            selftext: post.selftext ? post.selftext.substring(0, 500) : '', // Limit selftext
+            selftext: post.selftext || '', // Keep full selftext
             url: post.url || '', // External link or media URL
             is_video: post.is_video || false,
-            preview: post.preview?.images?.[0]?.source?.url ? {
-                images: [{
-                    source: {
-                        url: post.preview.images[0].source.url
-                    }
-                }]
-            } : null
+            preview: null // We'll handle images separately
         };
+
+        // Extract all gallery images if present
+        if (post.gallery_data && post.media_metadata) {
+            result.gallery = post.gallery_data.items.map(item => {
+                const media = post.media_metadata[item.media_id];
+                if (media && media.s) {
+                    return media.s.u ? media.s.u.replace(/&amp;/g, '&') : null;
+                }
+                return null;
+            }).filter(Boolean);
+        }
+        // Single image from preview
+        else if (post.preview?.images?.[0]?.source?.url) {
+            result.gallery = [post.preview.images[0].source.url.replace(/&amp;/g, '&')];
+        }
 
         // Add video URL if it's a video post
         if (post.is_video && post.media?.reddit_video?.fallback_url) {
@@ -970,13 +1018,34 @@
             return `<video class="post-image" controls><source src="${escapeHTML(post.video_url)}" type="video/mp4">Your browser does not support video.</video>`;
         }
 
-        // Handle image posts
-        if (!post.preview || !post.preview.images || !post.preview.images[0]) {
-            return '';
+        // Handle image gallery (single or multiple images)
+        if (post.gallery && post.gallery.length > 0) {
+            if (post.gallery.length === 1) {
+                // Single image - no gallery controls needed
+                return `<img class="post-image" src="${escapeHTML(post.gallery[0])}" alt="" loading="lazy" />`;
+            }
+            
+            // Multiple images - create gallery
+            const galleryId = `gallery-${post.id}`;
+            const images = post.gallery.map((url, index) => 
+                `<img class="post-gallery-image ${index === 0 ? 'active' : ''}" src="${escapeHTML(url)}" alt="" loading="lazy" />`
+            ).join('');
+            
+            const dots = post.gallery.map((_, index) => 
+                `<span class="gallery-dot ${index === 0 ? 'active' : ''}" onclick="window.setGalleryImage('${galleryId}', ${index})"></span>`
+            ).join('');
+            
+            return `
+                <div class="post-gallery" id="${galleryId}">
+                    ${images}
+                    <button class="gallery-nav prev" onclick="window.prevGalleryImage('${galleryId}')" aria-label="Previous">‹</button>
+                    <button class="gallery-nav next" onclick="window.nextGalleryImage('${galleryId}')" aria-label="Next">›</button>
+                    <div class="gallery-indicators">${dots}</div>
+                </div>
+            `;
         }
 
-        const imageUrl = post.preview.images[0].source.url.replace(/&amp;/g, '&');
-        return `<img class="post-image" src="${escapeHTML(imageUrl)}" alt="" loading="lazy" />`;
+        return '';
     }
 
     function getSelftextHTML(post) {
@@ -984,10 +1053,9 @@
             return '';
         }
 
-        let text = post.selftext.substring(0, 300);
+        let text = post.selftext; // Show full text, no truncation
         
         // Convert markdown links [text](url) to HTML links before escaping
-        // Match and replace with a simple callback
         const parts = [];
         let lastIndex = 0;
         const linkRegex = /\[([^\]]+)\]\(([^\)]+)\)/g;
@@ -1008,7 +1076,7 @@
             parts.push(escapeHTML(text.substring(lastIndex)));
         }
         
-        const html = parts.join('') + (post.selftext.length > 300 ? '...' : '');
+        const html = parts.join('').replace(/\n/g, '<br>'); // Preserve line breaks
         return `<div class="post-text">${html}</div>`;
     }
 

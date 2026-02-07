@@ -274,12 +274,77 @@
             display: block;
         }
 
+        .post-gallery {
+            position: relative;
+            width: 100%;
+            background: #000;
+        }
+
+        .post-gallery-image {
+            width: 100%;
+            display: none;
+        }
+
+        .post-gallery-image.active {
+            display: block;
+        }
+
+        .gallery-nav {
+            position: absolute;
+            top: 50%;
+            transform: translateY(-50%);
+            background: rgba(0, 0, 0, 0.5);
+            color: white;
+            border: none;
+            width: 40px;
+            height: 40px;
+            border-radius: 50%;
+            cursor: pointer;
+            font-size: 20px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: background 0.2s;
+        }
+
+        .gallery-nav:hover {
+            background: rgba(0, 0, 0, 0.8);
+        }
+
+        .gallery-nav.prev {
+            left: 10px;
+        }
+
+        .gallery-nav.next {
+            right: 10px;
+        }
+
+        .gallery-indicators {
+            position: absolute;
+            bottom: 10px;
+            left: 50%;
+            transform: translateX(-50%);
+            display: flex;
+            gap: 6px;
+        }
+
+        .gallery-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: rgba(255, 255, 255, 0.5);
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+
+        .gallery-dot.active {
+            background: white;
+        }
+
         .post-text {
             padding: 0 12px 12px;
             font-size: 14px;
             line-height: 21px;
-            max-height: 200px;
-            overflow: hidden;
         }
 
         .post-text a {
