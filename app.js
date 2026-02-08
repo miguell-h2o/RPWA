@@ -367,21 +367,22 @@
     }
 
     function updatePWA() {
-        if (!navigator.serviceWorker.controller) {
-            const now = new Date();
-            safeSetItem('lastUpdateTime', now.toISOString());
-            window.location.reload();
-            return;
-        }
-
         const now = new Date();
         safeSetItem('lastUpdateTime', now.toISOString());
 
+        if (!navigator.serviceWorker.controller) {
+            // No service worker yet, just reload
+            window.location.reload(true);
+            return;
+        }
+
+        // Tell service worker to skip waiting
         navigator.serviceWorker.controller.postMessage({ type: 'SKIP_WAITING' });
         
-        navigator.serviceWorker.addEventListener('controllerchange', () => {
-            window.location.reload();
-        }, { once: true });
+        // Force reload after a short delay to let SW activate
+        setTimeout(() => {
+            window.location.reload(true);
+        }, 500);
     }
 
     // ============================================================================
@@ -641,9 +642,13 @@
         updateQueueStatus();
         
         const pendingJobs = syncQueue.filter(j => j.status === 'pending' || j.status === 'failed');
+        let syncInterrupted = false;
         
         for (const job of pendingJobs) {
-            if (!navigator.onLine) break;
+            if (!navigator.onLine) {
+                syncInterrupted = true;
+                break;
+            }
             
             try {
                 job.status = 'processing';
@@ -704,7 +709,9 @@
         isProcessingQueue = false;
         updateQueueStatus();
         
-        if (pendingUpdates.my.count > 0 || pendingUpdates.popular.count > 0) {
+        // Only show toast at END of entire sync OR if interrupted by going offline
+        if ((pendingUpdates.my.count > 0 || pendingUpdates.popular.count > 0) && 
+            (pendingJobs.length === 0 || syncInterrupted)) {
             showUpdateToast();
         }
     }
@@ -713,15 +720,26 @@
         const queueIndicator = document.getElementById('queueIndicator');
         if (!queueIndicator) return;
         
-        const pending = syncQueue.filter(j => j.status === 'pending' || j.status === 'processing').length;
-        const failed = syncQueue.filter(j => j.status === 'failed').length;
+        // Find the job currently being processed
+        const processing = syncQueue.find(j => j.status === 'processing');
+        const failed = syncQueue.filter(j => j.status === 'failed');
         
-        if (pending > 0) {
-            queueIndicator.textContent = `Syncing ${pending}...`;
-            queueIndicator.classList.add('active');
-            queueIndicator.classList.remove('warning');
-        } else if (failed > 0) {
-            queueIndicator.textContent = `${failed} failed`;
+        if (processing) {
+            // Show only the current feed being synced
+            let feedName = '';
+            if (processing.type === 'fetch_popular') {
+                feedName = 'Popular';
+            } else if (processing.subreddit) {
+                feedName = `r/${processing.subreddit}`;
+            }
+            
+            if (feedName) {
+                queueIndicator.textContent = `Syncing ${feedName}`;
+                queueIndicator.classList.add('active');
+                queueIndicator.classList.remove('warning');
+            }
+        } else if (failed.length > 0) {
+            queueIndicator.textContent = `${failed.length} failed`;
             queueIndicator.classList.add('active', 'warning');
         } else {
             queueIndicator.classList.remove('active', 'warning');
@@ -1490,20 +1508,12 @@
     }
 
     function updateRateLimitDisplay() {
+        // Rate limit info removed from UI but still tracked internally
+        // Keeping this function for internal monitoring if needed
         const rateLimitInfo = document.getElementById('rateLimitInfo');
         
         if (rateLimitInfo) {
-            const remaining = rateLimitState.remainingRequests;
-            const total = CONFIG.REQUESTS_PER_MINUTE;
-            rateLimitInfo.textContent = `${remaining}/${total}`;
-            
-            if (remaining <= 2) {
-                rateLimitInfo.style.background = 'rgba(244, 67, 54, 0.8)';
-            } else if (remaining <= 5) {
-                rateLimitInfo.style.background = 'rgba(255, 152, 0, 0.8)';
-            } else {
-                rateLimitInfo.style.background = 'rgba(76, 175, 80, 0.8)';
-            }
+            rateLimitInfo.style.display = 'none'; // Hide the rate limit display
         }
     }
 
