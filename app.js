@@ -1,4 +1,5 @@
 // Reddit PWA - Main Application Logic
+// Updated with: Background updates, Offline sync queue, Bookmarking, Fixed gallery, Toast notifications
 
 (function() {
     'use strict';
@@ -14,7 +15,8 @@
         MAX_BACKOFF: 30000,
         POSTS_LIMIT: 25,
         UPDATE_CHECK_INTERVAL: 5 * 60 * 1000, // 5 minutes
-        RATE_LIMIT_RESET_INTERVAL: 60 * 1000 // 1 minute
+        RATE_LIMIT_RESET_INTERVAL: 60 * 1000, // 1 minute
+        REQUEST_TIMEOUT: 15000 // 15 seconds timeout
     };
 
     // ============================================================================
@@ -24,8 +26,9 @@
     let cachedPosts = [];
     let popularPosts = [];
     let blockedSubreddits = [];
-    let currentFeed = 'my'; // 'my' or 'popular'
-    let activeFilter = 'all'; // 'all' or specific subreddit name
+    let bookmarkedPosts = []; // NEW: Bookmarked posts
+    let currentFeed = 'my'; // 'my', 'popular', or 'starred'
+    let activeFilter = 'all';
     let rateLimitState = {
         lastRequestTime: 0,
         remainingRequests: CONFIG.REQUESTS_PER_MINUTE,
@@ -34,9 +37,28 @@
     };
     let countrySuggestions = [];
     let selectedCountry = null;
+    
+    // NEW: Background update system
+    let pendingUpdates = {
+        my: { posts: [], count: 0 },
+        popular: { posts: [], count: 0 }
+    };
+    
+    // NEW: Offline sync queue
+    let syncQueue = [];
+    let isProcessingQueue = false;
+    
+    // NEW: Storage quota
+    let storageQuota = 5 * 1024 * 1024; // Default 5MB
+    const MAX_SAFE_STORAGE = 8 * 1024 * 1024; // Cap at 8MB
+    
+    // NEW: Periodic task intervals (for cleanup)
+    let displayUpdateInterval = null;
+    let updateCheckInterval = null;
+    let rateLimitResetInterval = null;
 
     // ============================================================================
-    // LOCAL STORAGE HELPERS (with error handling)
+    // LOCAL STORAGE HELPERS
     // ============================================================================
     function safeGetItem(key, defaultValue) {
         try {
@@ -55,7 +77,7 @@
         } catch (error) {
             console.error('Error writing to localStorage:', error);
             if (error.name === 'QuotaExceededError') {
-                alert('Storage quota exceeded. Some data may not be saved.');
+                showToastMessage('Storage full! Old posts will be cleaned up.', 'warning');
             }
             return false;
         }
@@ -70,14 +92,31 @@
         cachedPosts = safeGetItem('cachedPosts', []);
         popularPosts = safeGetItem('popularPosts', []);
         blockedSubreddits = safeGetItem('blockedSubreddits', []);
+        bookmarkedPosts = safeGetItem('bookmarkedPosts', []); // NEW
+        syncQueue = safeGetItem('syncQueue', []); // NEW
         currentFeed = safeGetItem('currentFeed', 'my');
-        const savedRateLimitState = safeGetItem('rateLimitState', null);
         
+        // NEW: Fix rate limit state corruption
+        const savedRateLimitState = safeGetItem('rateLimitState', null);
         if (savedRateLimitState) {
-            rateLimitState = { ...rateLimitState, ...savedRateLimitState };
+            const now = Date.now();
+            if (savedRateLimitState.resetTime && now >= savedRateLimitState.resetTime) {
+                // Rate limit expired, reset it
+                rateLimitState = {
+                    lastRequestTime: 0,
+                    remainingRequests: CONFIG.REQUESTS_PER_MINUTE,
+                    resetTime: now + CONFIG.RATE_LIMIT_RESET_INTERVAL,
+                    requestCount: 0
+                };
+            } else {
+                rateLimitState = { ...rateLimitState, ...savedRateLimitState };
+            }
         }
 
-        // Load country suggestions first
+        // NEW: Initialize storage quota
+        await initializeStorageQuota();
+
+        // Load country suggestions
         await loadCountrySuggestions();
 
         // Set up event listeners
@@ -89,13 +128,13 @@
         // Show feed tabs if user has subreddits
         updateFeedTabsVisibility();
 
-        // Show welcome screen if no subreddits, otherwise render
+        // Show welcome screen if no subreddits
         if (subreddits.length === 0) {
             showWelcomeScreen();
         } else {
             renderSubreddits();
             renderSubredditFilter();
-            switchFeed(currentFeed); // Restore saved feed
+            switchFeed(currentFeed);
             updateAllDisplays();
         }
 
@@ -107,6 +146,30 @@
 
         // Check for updates
         checkForUpdates();
+        
+        // NEW: Process any pending sync jobs
+        if (navigator.onLine && syncQueue.length > 0) {
+            processSyncQueue();
+        }
+    }
+
+    // ============================================================================
+    // STORAGE QUOTA MANAGEMENT - NEW
+    // ============================================================================
+    async function initializeStorageQuota() {
+        if ('storage' in navigator && 'estimate' in navigator.storage) {
+            try {
+                const estimate = await navigator.storage.estimate();
+                const availableQuota = estimate.quota || storageQuota;
+                
+                // Use smaller of: browser quota or safety cap
+                storageQuota = Math.min(availableQuota * 0.8, MAX_SAFE_STORAGE);
+                
+                console.log(`Storage quota: ${formatBytes(storageQuota)} (Browser: ${formatBytes(availableQuota)})`);
+            } catch (error) {
+                console.error('Could not estimate storage:', error);
+            }
+        }
     }
 
     // ============================================================================
@@ -163,8 +226,10 @@
         // Feed tabs
         const myFeedTab = document.getElementById('myFeedTab');
         const popularFeedTab = document.getElementById('popularFeedTab');
+        const starredFeedTab = document.getElementById('starredFeedTab'); // NEW
         if (myFeedTab) myFeedTab.addEventListener('click', () => switchFeed('my'));
         if (popularFeedTab) popularFeedTab.addEventListener('click', () => switchFeed('popular'));
+        if (starredFeedTab) starredFeedTab.addEventListener('click', () => switchFeed('starred')); // NEW
 
         // Subreddit popup
         const popupCloseBtn = document.getElementById('popupCloseBtn');
@@ -179,6 +244,25 @@
             subredditPopup.addEventListener('click', (e) => {
                 if (e.target === subredditPopup) closeSubredditPopup();
             });
+        }
+        
+        // NEW: Gallery navigation with event delegation
+        document.addEventListener('click', handleGalleryNavigation);
+    }
+
+    // NEW: Gallery navigation handler
+    function handleGalleryNavigation(e) {
+        const gallery = e.target.closest('.post-gallery');
+        if (!gallery) return;
+        
+        if (e.target.classList.contains('gallery-nav')) {
+            e.preventDefault();
+            const direction = e.target.classList.contains('prev') ? -1 : 1;
+            navigateGallery(gallery, direction);
+        } else if (e.target.classList.contains('gallery-dot')) {
+            e.preventDefault();
+            const index = parseInt(e.target.dataset.index);
+            setGalleryImage(gallery, index);
         }
     }
 
@@ -231,6 +315,15 @@
     function setupOnlineOfflineListeners() {
         window.addEventListener('online', handleOnlineStatus);
         window.addEventListener('offline', handleOnlineStatus);
+        
+        // NEW: Process sync queue when coming online
+        window.addEventListener('online', () => {
+            if (syncQueue.length > 0) {
+                showToastMessage('Back online! Syncing...', 'info');
+                processSyncQueue();
+            }
+        });
+        
         handleOnlineStatus(); // Initial check
     }
 
@@ -252,8 +345,6 @@
     // ============================================================================
     // UPDATE MANAGEMENT
     // ============================================================================
-    let updateCheckInterval;
-
     function checkForUpdates() {
         if (!navigator.onLine || !('serviceWorker' in navigator)) {
             return;
@@ -277,21 +368,17 @@
 
     function updatePWA() {
         if (!navigator.serviceWorker.controller) {
-            // Save update timestamp
             const now = new Date();
             safeSetItem('lastUpdateTime', now.toISOString());
             window.location.reload();
             return;
         }
 
-        // Save update timestamp
         const now = new Date();
         safeSetItem('lastUpdateTime', now.toISOString());
 
-        // Tell the service worker to skip waiting
         navigator.serviceWorker.controller.postMessage({ type: 'SKIP_WAITING' });
         
-        // Listen for the new service worker to take control, then reload
         navigator.serviceWorker.addEventListener('controllerchange', () => {
             window.location.reload();
         }, { once: true });
@@ -313,6 +400,413 @@
     }
 
     // ============================================================================
+    // TOAST NOTIFICATION SYSTEM - NEW
+    // ============================================================================
+    function showToastMessage(message, type = 'info', duration = 3000) {
+        const existingToast = document.querySelector('.toast-message');
+        if (existingToast) existingToast.remove();
+        
+        const toast = document.createElement('div');
+        toast.className = `toast-message toast-${type}`;
+        toast.textContent = message;
+        
+        document.body.appendChild(toast);
+        
+        setTimeout(() => toast.classList.add('visible'), 10);
+        
+        if (duration > 0) {
+            setTimeout(() => {
+                toast.classList.remove('visible');
+                setTimeout(() => toast.remove(), 300);
+            }, duration);
+        }
+        
+        return toast;
+    }
+
+    // ============================================================================
+    // CONFIRMATION DIALOG SYSTEM - NEW
+    // ============================================================================
+    function showConfirmDialog(message, onConfirm, onCancel) {
+        const dialog = document.createElement('div');
+        dialog.className = 'confirm-dialog-overlay';
+        dialog.innerHTML = `
+            <div class="confirm-dialog">
+                <div class="confirm-message">${message}</div>
+                <div class="confirm-actions">
+                    <button class="confirm-btn cancel">Cancel</button>
+                    <button class="confirm-btn confirm">Confirm</button>
+                </div>
+            </div>
+        `;
+        
+        document.body.appendChild(dialog);
+        
+        const cancelBtn = dialog.querySelector('.cancel');
+        const confirmBtn = dialog.querySelector('.confirm');
+        
+        const cleanup = () => {
+            dialog.classList.remove('visible');
+            setTimeout(() => dialog.remove(), 300);
+        };
+        
+        cancelBtn.onclick = () => {
+            cleanup();
+            if (onCancel) onCancel();
+        };
+        
+        confirmBtn.onclick = () => {
+            cleanup();
+            if (onConfirm) onConfirm();
+        };
+        
+        dialog.onclick = (e) => {
+            if (e.target === dialog) {
+                cleanup();
+                if (onCancel) onCancel();
+            }
+        };
+        
+        setTimeout(() => dialog.classList.add('visible'), 10);
+    }
+
+    // ============================================================================
+    // BACKGROUND UPDATE SYSTEM - NEW
+    // ============================================================================
+    async function fetchPostsInBackground() {
+        if (subreddits.length === 0 || !navigator.onLine) return;
+
+        const statusDot = document.getElementById('statusDot');
+        if (statusDot) statusDot.className = 'status-dot loading';
+
+        let totalNewPosts = 0;
+
+        for (const sub of subreddits) {
+            try {
+                const posts = await fetchSubredditPostsWithTimeout(sub);
+                
+                if (posts && posts.length > 0) {
+                    const existingIds = new Set(cachedPosts.map(p => p.id));
+                    const newPosts = posts.filter(p => !existingIds.has(p.id));
+                    
+                    if (newPosts.length > 0) {
+                        pendingUpdates.my.posts.push(...newPosts);
+                        totalNewPosts += newPosts.length;
+                    }
+                }
+            } catch (error) {
+                console.error(`Background fetch failed for r/${sub}:`, error);
+                // Continue with other subreddits
+            }
+        }
+
+        if (statusDot) updateStatusDot();
+
+        if (totalNewPosts > 0) {
+            pendingUpdates.my.count = totalNewPosts;
+            showUpdateToast();
+        }
+    }
+
+    async function fetchPopularPostsInBackground() {
+        if (!navigator.onLine) return;
+
+        try {
+            const posts = await fetchSubredditPostsWithTimeout('popular');
+            
+            if (posts && posts.length > 0) {
+                const existingIds = new Set(popularPosts.map(p => p.id));
+                const newPosts = posts.filter(p => !existingIds.has(p.id));
+                
+                if (newPosts.length > 0) {
+                    pendingUpdates.popular.posts.push(...newPosts);
+                    pendingUpdates.popular.count = newPosts.length;
+                    showUpdateToast();
+                }
+            }
+        } catch (error) {
+            console.error('Background fetch failed for popular:', error);
+        }
+    }
+
+    function showUpdateToast() {
+        const existingToast = document.getElementById('updateToast');
+        if (existingToast) {
+            updateToastContent();
+            return;
+        }
+
+        const toast = document.createElement('div');
+        toast.id = 'updateToast';
+        toast.className = 'update-toast';
+        toast.innerHTML = `
+            <div class="toast-content">
+                <span class="toast-message" id="toastMessage"></span>
+                <button class="toast-action" onclick="window.applyPendingUpdates()">View Updates</button>
+                <button class="toast-close" onclick="window.dismissToast()">×</button>
+            </div>
+        `;
+        
+        document.body.appendChild(toast);
+        updateToastContent();
+        
+        setTimeout(() => toast.classList.add('visible'), 10);
+    }
+
+    function updateToastContent() {
+        const messageEl = document.getElementById('toastMessage');
+        if (!messageEl) return;
+        
+        const myCount = pendingUpdates.my.count;
+        const popCount = pendingUpdates.popular.count;
+        const total = myCount + popCount;
+        
+        if (currentFeed === 'my' && myCount > 0) {
+            messageEl.textContent = `${myCount} new post${myCount > 1 ? 's' : ''}`;
+        } else if (currentFeed === 'popular' && popCount > 0) {
+            messageEl.textContent = `${popCount} new post${popCount > 1 ? 's' : ''}`;
+        } else if (total > 0) {
+            messageEl.textContent = `${total} new post${total > 1 ? 's' : ''} available`;
+        }
+    }
+
+    function applyPendingUpdates() {
+        if (pendingUpdates.my.posts.length > 0) {
+            const allPosts = [...cachedPosts, ...pendingUpdates.my.posts];
+            cachedPosts = removeDuplicatePosts(allPosts).sort((a, b) => b.created_utc - a.created_utc);
+            safeSetItem('cachedPosts', cachedPosts);
+            cleanupOldPosts();
+        }
+        
+        if (pendingUpdates.popular.posts.length > 0) {
+            const allPosts = [...popularPosts, ...pendingUpdates.popular.posts];
+            popularPosts = removeDuplicatePosts(allPosts).sort((a, b) => b.created_utc - a.created_utc);
+            safeSetItem('popularPosts', popularPosts);
+            cleanupOldPosts();
+        }
+        
+        pendingUpdates = {
+            my: { posts: [], count: 0 },
+            popular: { posts: [], count: 0 }
+        };
+        
+        renderPosts();
+        renderSubredditFilter();
+        updateAllDisplays();
+        
+        dismissToast();
+        showToastMessage('Feed updated!', 'success');
+    }
+
+    function dismissToast() {
+        const toast = document.getElementById('updateToast');
+        if (toast) {
+            toast.classList.remove('visible');
+            setTimeout(() => toast.remove(), 300);
+        }
+    }
+
+    // Expose globally
+    window.applyPendingUpdates = applyPendingUpdates;
+    window.dismissToast = dismissToast;
+
+    // ============================================================================
+    // OFFLINE SYNC QUEUE - NEW
+    // ============================================================================
+    function queueSyncJob(type, subreddit = null) {
+        const job = {
+            id: `${type}_${subreddit || 'all'}_${Date.now()}`,
+            type: type,
+            subreddit: subreddit,
+            timestamp: Date.now(),
+            retries: 0,
+            status: 'pending'
+        };
+        
+        syncQueue.push(job);
+        safeSetItem('syncQueue', syncQueue);
+        
+        if (navigator.onLine && !isProcessingQueue) {
+            processSyncQueue();
+        }
+        
+        updateQueueStatus();
+        return job;
+    }
+
+    async function processSyncQueue() {
+        if (isProcessingQueue || syncQueue.length === 0) return;
+        
+        isProcessingQueue = true;
+        updateQueueStatus();
+        
+        const pendingJobs = syncQueue.filter(j => j.status === 'pending' || j.status === 'failed');
+        
+        for (const job of pendingJobs) {
+            if (!navigator.onLine) break;
+            
+            try {
+                job.status = 'processing';
+                safeSetItem('syncQueue', syncQueue);
+                updateQueueStatus();
+                
+                if (job.type === 'fetch_subreddit' && job.subreddit) {
+                    const posts = await fetchSubredditPostsWithTimeout(job.subreddit);
+                    
+                    if (posts && posts.length > 0) {
+                        const existingIds = new Set(cachedPosts.map(p => p.id));
+                        const newPosts = posts.filter(p => !existingIds.has(p.id));
+                        
+                        if (newPosts.length > 0) {
+                            pendingUpdates.my.posts.push(...newPosts);
+                            pendingUpdates.my.count += newPosts.length;
+                        }
+                    }
+                    
+                    job.status = 'completed';
+                    
+                } else if (job.type === 'fetch_popular') {
+                    const posts = await fetchSubredditPostsWithTimeout('popular');
+                    
+                    if (posts && posts.length > 0) {
+                        const existingIds = new Set(popularPosts.map(p => p.id));
+                        const newPosts = posts.filter(p => !existingIds.has(p.id));
+                        
+                        if (newPosts.length > 0) {
+                            pendingUpdates.popular.posts.push(...newPosts);
+                            pendingUpdates.popular.count += newPosts.length;
+                        }
+                    }
+                    
+                    job.status = 'completed';
+                }
+                
+            } catch (error) {
+                console.error(`Sync job ${job.id} failed:`, error);
+                job.retries++;
+                
+                if (job.retries >= 3) {
+                    job.status = 'failed_max_retries';
+                } else {
+                    job.status = 'failed';
+                }
+            }
+            
+            safeSetItem('syncQueue', syncQueue);
+            updateQueueStatus();
+            
+            await new Promise(resolve => setTimeout(resolve, 1000));
+        }
+        
+        syncQueue = syncQueue.filter(j => j.status !== 'completed');
+        safeSetItem('syncQueue', syncQueue);
+        
+        isProcessingQueue = false;
+        updateQueueStatus();
+        
+        if (pendingUpdates.my.count > 0 || pendingUpdates.popular.count > 0) {
+            showUpdateToast();
+        }
+    }
+
+    function updateQueueStatus() {
+        const queueIndicator = document.getElementById('queueIndicator');
+        if (!queueIndicator) return;
+        
+        const pending = syncQueue.filter(j => j.status === 'pending' || j.status === 'processing').length;
+        const failed = syncQueue.filter(j => j.status === 'failed').length;
+        
+        if (pending > 0) {
+            queueIndicator.textContent = `Syncing ${pending}...`;
+            queueIndicator.classList.add('active');
+            queueIndicator.classList.remove('warning');
+        } else if (failed > 0) {
+            queueIndicator.textContent = `${failed} failed`;
+            queueIndicator.classList.add('active', 'warning');
+        } else {
+            queueIndicator.classList.remove('active', 'warning');
+        }
+    }
+
+    // ============================================================================
+    // FETCH WITH TIMEOUT - NEW
+    // ============================================================================
+    async function fetchSubredditPostsWithTimeout(subreddit, timeout = CONFIG.REQUEST_TIMEOUT) {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), timeout);
+        
+        try {
+            await waitForRateLimit();
+            
+            const url = `https://www.reddit.com/r/${subreddit}.json?limit=${CONFIG.POSTS_LIMIT}&raw_json=1`;
+            const response = await fetch(url, { signal: controller.signal });
+            
+            clearTimeout(timeoutId);
+            
+            rateLimitState.lastRequestTime = Date.now();
+            rateLimitState.remainingRequests = Math.max(0, rateLimitState.remainingRequests - 1);
+            rateLimitState.requestCount++;
+            
+            updateRateLimitFromHeaders(response.headers);
+            
+            if (response.status === 429) {
+                throw new Error('Rate limited');
+            }
+            
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status}`);
+            }
+            
+            const data = await response.json();
+            const posts = data.data.children.map(child => stripPostData(child.data));
+            
+            safeSetItem('rateLimitState', rateLimitState);
+            updateAllDisplays();
+            
+            return posts;
+            
+        } catch (error) {
+            clearTimeout(timeoutId);
+            
+            if (error.name === 'AbortError') {
+                throw new Error('Request timeout');
+            }
+            throw error;
+        }
+    }
+
+    // ============================================================================
+    // BOOKMARKING SYSTEM - NEW
+    // ============================================================================
+    function toggleBookmark(postId) {
+        const post = [...cachedPosts, ...popularPosts].find(p => p.id === postId);
+        if (!post) return;
+        
+        const existingIndex = bookmarkedPosts.findIndex(p => p.id === postId);
+        
+        if (existingIndex > -1) {
+            showConfirmDialog(
+                'Remove this post from your starred posts?',
+                () => {
+                    bookmarkedPosts.splice(existingIndex, 1);
+                    safeSetItem('bookmarkedPosts', bookmarkedPosts);
+                    showToastMessage('Removed from starred posts', 'success');
+                    renderPosts();
+                    updateStorageStats();
+                }
+            );
+        } else {
+            bookmarkedPosts.push(post);
+            safeSetItem('bookmarkedPosts', bookmarkedPosts);
+            showToastMessage('Added to starred posts', 'success');
+            renderPosts();
+            updateStorageStats();
+        }
+    }
+
+    window.toggleBookmark = toggleBookmark;
+
+    // ============================================================================
     // SUBREDDIT FILTERING
     // ============================================================================
     function renderSubredditFilter() {
@@ -322,7 +816,6 @@
         if (currentFeed === 'my' && subreddits.length > 0) {
             filterBar.classList.add('active');
             
-            // Only show filters for subreddits that have posts
             const subsWithPosts = [...new Set(cachedPosts.map(p => p.subreddit))];
             const availableSubs = subreddits.filter(sub => 
                 subsWithPosts.some(s => s.toLowerCase() === sub.toLowerCase())
@@ -340,7 +833,6 @@
             
             filterBar.innerHTML = chips.join('');
             
-            // Add click handlers
             filterBar.querySelectorAll('.filter-chip').forEach(chip => {
                 chip.addEventListener('click', () => {
                     const filter = chip.dataset.filter;
@@ -355,7 +847,6 @@
     function setActiveFilter(filter) {
         activeFilter = filter;
         
-        // Update UI
         document.querySelectorAll('.filter-chip').forEach(chip => {
             if (chip.dataset.filter === filter) {
                 chip.classList.add('active');
@@ -385,7 +876,6 @@
         
         if (!popup || !nameEl || !infoEl) return;
 
-        // Show popup immediately with loading state
         nameEl.textContent = `r/${subredditName}`;
         statsEl.textContent = 'Loading...';
         infoEl.textContent = 'Loading subreddit information...';
@@ -393,7 +883,6 @@
         bannerEl.style.backgroundImage = '';
         bannerEl.style.background = 'linear-gradient(to bottom, #ff4500, rgba(255, 69, 0, 0))';
         
-        // Update button states
         const isFollowing = subreddits.some(s => s.toLowerCase() === subredditName.toLowerCase());
         const isBlocked = blockedSubreddits.some(s => s.toLowerCase() === subredditName.toLowerCase());
         
@@ -409,7 +898,6 @@
         
         popup.classList.add('active');
 
-        // Fetch subreddit info from API
         try {
             const response = await fetch(`https://www.reddit.com/r/${subredditName}/about.json`);
             if (!response.ok) throw new Error('Failed to fetch subreddit info');
@@ -417,23 +905,18 @@
             const data = await response.json();
             const subData = data.data;
             
-            // Update with real data
             nameEl.textContent = `r/${subData.display_name || subredditName}`;
             
-            // Stats - only show subscribers
             const subscribers = subData.subscribers ? formatNumber(subData.subscribers) : 'N/A';
             statsEl.textContent = `${subscribers} members`;
             
-            // Description
             infoEl.textContent = subData.public_description || subData.description || 'No description available.';
             
-            // Icon
             if (subData.icon_img && subData.icon_img.trim()) {
                 iconEl.src = subData.icon_img.replace(/&amp;/g, '&');
                 iconEl.style.display = 'block';
             }
             
-            // Banner - use header_img if available, otherwise gradient with key_color
             if (subData.header_img && subData.header_img.trim()) {
                 bannerEl.style.backgroundImage = `url(${subData.header_img.replace(/&amp;/g, '&')})`;
             } else if (subData.key_color) {
@@ -468,7 +951,6 @@
         renderSubredditFilter();
         updateFeedTabsVisibility();
         
-        // Update button state
         const followBtn = document.getElementById('popupFollowBtn');
         const isFollowing = subreddits.includes(currentPopupSubreddit);
         if (followBtn) {
@@ -480,24 +962,39 @@
     function toggleBlockSubreddit() {
         if (!currentPopupSubreddit) return;
         
-        if (blockedSubreddits.includes(currentPopupSubreddit)) {
-            // Unblock
-            blockedSubreddits = blockedSubreddits.filter(s => s !== currentPopupSubreddit);
-        } else {
-            // Block
-            blockedSubreddits.push(currentPopupSubreddit);
-        }
-        
-        safeSetItem('blockedSubreddits', blockedSubreddits);
-        renderSubreddits(); // Update blocked list in sidebar
-        renderPosts(); // Re-render to hide blocked posts
-        
-        // Update button state
-        const blockBtn = document.getElementById('popupBlockBtn');
         const isBlocked = blockedSubreddits.includes(currentPopupSubreddit);
-        if (blockBtn) {
-            blockBtn.textContent = isBlocked ? 'Blocked' : 'Block';
-            blockBtn.className = isBlocked ? 'popup-btn-block blocked' : 'popup-btn-block';
+        
+        if (isBlocked) {
+            blockedSubreddits = blockedSubreddits.filter(s => s !== currentPopupSubreddit);
+            safeSetItem('blockedSubreddits', blockedSubreddits);
+            renderSubreddits();
+            renderPosts();
+            
+            const blockBtn = document.getElementById('popupBlockBtn');
+            if (blockBtn) {
+                blockBtn.textContent = 'Block';
+                blockBtn.className = 'popup-btn-block';
+            }
+            
+            showToastMessage(`Unblocked r/${currentPopupSubreddit}`, 'success');
+        } else {
+            showConfirmDialog(
+                `Block r/${currentPopupSubreddit}? Posts from this subreddit will be hidden from your Popular feed.`,
+                () => {
+                    blockedSubreddits.push(currentPopupSubreddit);
+                    safeSetItem('blockedSubreddits', blockedSubreddits);
+                    renderSubreddits();
+                    renderPosts();
+                    
+                    const blockBtn = document.getElementById('popupBlockBtn');
+                    if (blockBtn) {
+                        blockBtn.textContent = 'Blocked';
+                        blockBtn.className = 'popup-btn-block blocked';
+                    }
+                    
+                    showToastMessage(`Blocked r/${currentPopupSubreddit}`, 'success');
+                }
+            );
         }
     }
 
@@ -506,50 +1003,57 @@
         safeSetItem('blockedSubreddits', blockedSubreddits);
         renderSubreddits();
         renderPosts();
+        showToastMessage(`Unblocked r/${sub}`, 'success');
     }
 
-    // Expose functions globally for onclick
     window.openSubredditPopup = openSubredditPopup;
     window.unblockSubreddit = unblockSubreddit;
 
-    // Gallery navigation functions
-    window.setGalleryImage = function(galleryId, index) {
-        const gallery = document.getElementById(galleryId);
-        if (!gallery) return;
+    // ============================================================================
+    // GALLERY NAVIGATION - FIXED
+    // ============================================================================
+    function navigateGallery(gallery, direction) {
+        const images = gallery.querySelectorAll('.post-gallery-image');
+        const currentIndex = parseInt(gallery.dataset.current || 0);
+        const nextIndex = (currentIndex + direction + images.length) % images.length;
         
+        setGalleryImage(gallery, nextIndex);
+    }
+
+    function setGalleryImage(gallery, index) {
         const images = gallery.querySelectorAll('.post-gallery-image');
         const dots = gallery.querySelectorAll('.gallery-dot');
+        const counter = gallery.querySelector('.gallery-counter');
+        const currentIndex = parseInt(gallery.dataset.current || 0);
         
-        images.forEach((img, i) => {
-            img.classList.toggle('active', i === index);
-        });
+        const currentImg = images[currentIndex];
+        const nextImg = images[index];
         
-        dots.forEach((dot, i) => {
-            dot.classList.toggle('active', i === index);
-        });
-    };
+        if (!nextImg.classList.contains('loaded') && !nextImg.complete) {
+            gallery.classList.add('loading');
+            
+            nextImg.addEventListener('load', () => {
+                performImageTransition(gallery, images, dots, counter, currentIndex, index);
+                gallery.classList.remove('loading');
+            }, { once: true });
+        } else {
+            performImageTransition(gallery, images, dots, counter, currentIndex, index);
+        }
+    }
 
-    window.nextGalleryImage = function(galleryId) {
-        const gallery = document.getElementById(galleryId);
-        if (!gallery) return;
+    function performImageTransition(gallery, images, dots, counter, currentIndex, nextIndex) {
+        images[currentIndex].classList.remove('active');
+        images[nextIndex].classList.add('active');
         
-        const images = gallery.querySelectorAll('.post-gallery-image');
-        let currentIndex = Array.from(images).findIndex(img => img.classList.contains('active'));
-        let nextIndex = (currentIndex + 1) % images.length;
+        dots[currentIndex].classList.remove('active');
+        dots[nextIndex].classList.add('active');
         
-        window.setGalleryImage(galleryId, nextIndex);
-    };
-
-    window.prevGalleryImage = function(galleryId) {
-        const gallery = document.getElementById(galleryId);
-        if (!gallery) return;
+        gallery.dataset.current = nextIndex;
         
-        const images = gallery.querySelectorAll('.post-gallery-image');
-        let currentIndex = Array.from(images).findIndex(img => img.classList.contains('active'));
-        let prevIndex = (currentIndex - 1 + images.length) % images.length;
-        
-        window.setGalleryImage(galleryId, prevIndex);
-    };
+        if (counter) {
+            counter.textContent = `${nextIndex + 1} / ${images.length}`;
+        }
+    }
 
     // ============================================================================
     // FEED SWITCHING
@@ -564,61 +1068,25 @@
     function switchFeed(feed) {
         currentFeed = feed;
         safeSetItem('currentFeed', currentFeed);
-
-        // Reset filter when switching feeds
         activeFilter = 'all';
 
-        // Update tab active states
         const myFeedTab = document.getElementById('myFeedTab');
         const popularFeedTab = document.getElementById('popularFeedTab');
+        const starredFeedTab = document.getElementById('starredFeedTab');
 
-        if (myFeedTab && popularFeedTab) {
-            if (feed === 'my') {
-                myFeedTab.classList.add('active');
-                popularFeedTab.classList.remove('active');
-            } else {
-                myFeedTab.classList.remove('active');
-                popularFeedTab.classList.add('active');
-            }
+        if (myFeedTab && popularFeedTab && starredFeedTab) {
+            myFeedTab.classList.toggle('active', feed === 'my');
+            popularFeedTab.classList.toggle('active', feed === 'popular');
+            starredFeedTab.classList.toggle('active', feed === 'starred');
         }
 
-        // Show/hide filter bar
         renderSubredditFilter();
-
-        // Render appropriate posts
         renderPosts();
 
-        // If switching to popular and no posts, fetch them
-        if (feed === 'popular' && popularPosts.length === 0) {
-            fetchPopularPosts();
+        if (feed === 'popular' && popularPosts.length === 0 && navigator.onLine) {
+            queueSyncJob('fetch_popular');
+            processSyncQueue();
         }
-    }
-
-    async function fetchPopularPosts() {
-        if (!navigator.onLine) {
-            alert('You are offline. Cannot fetch popular posts.');
-            return;
-        }
-
-        const statusDot = document.getElementById('statusDot');
-        if (statusDot) statusDot.className = 'status-dot loading';
-
-        try {
-            const posts = await fetchSubredditPosts('popular');
-            
-            if (posts.length > 0) {
-                popularPosts = posts.sort((a, b) => b.created_utc - a.created_utc);
-                safeSetItem('popularPosts', popularPosts);
-                
-                // Check storage and cleanup if needed
-                cleanupOldPosts();
-            }
-        } catch (error) {
-            console.error('Failed to fetch popular posts:', error);
-        }
-
-        // Reload page to refresh everything
-        window.location.reload();
     }
 
     // ============================================================================
@@ -637,7 +1105,6 @@
             ).join('');
         }
 
-        // Render blocked subreddits
         if (blockedList && blockedSection) {
             if (blockedSubreddits.length === 0) {
                 blockedSection.style.display = 'none';
@@ -654,12 +1121,10 @@
         const input = document.getElementById('subredditInput');
         const sub = input.value.trim().replace(/^r\//, '');
         
-        if (!sub) {
-            return;
-        }
+        if (!sub) return;
 
         if (subreddits.includes(sub)) {
-            alert('Subreddit already added');
+            showToastMessage('Subreddit already added', 'warning');
             return;
         }
 
@@ -668,34 +1133,39 @@
         input.value = '';
         renderSubreddits();
         
-        // Fetch posts only from the newly added subreddit
-        await fetchPostsFromSubreddit(sub);
-        
         toggleSidebar();
+        
+        // Queue fetch for new subreddit
+        queueSyncJob('fetch_subreddit', sub);
+        processSyncQueue();
     }
 
     function removeSubreddit(sub) {
-        subreddits = subreddits.filter(s => s.toLowerCase() !== sub.toLowerCase());
-        safeSetItem('subreddits', subreddits);
-        
-        // Remove posts from this subreddit (case insensitive)
-        cachedPosts = cachedPosts.filter(post => 
-            post.subreddit.toLowerCase() !== sub.toLowerCase()
+        showConfirmDialog(
+            `Remove r/${sub} from your feed? This will also delete all cached posts from this subreddit.`,
+            () => {
+                subreddits = subreddits.filter(s => s.toLowerCase() !== sub.toLowerCase());
+                safeSetItem('subreddits', subreddits);
+                
+                cachedPosts = cachedPosts.filter(post => 
+                    post.subreddit.toLowerCase() !== sub.toLowerCase()
+                );
+                safeSetItem('cachedPosts', cachedPosts);
+                
+                if (activeFilter.toLowerCase() === sub.toLowerCase()) {
+                    activeFilter = 'all';
+                }
+                
+                updateFeedTabsVisibility();
+                renderSubreddits();
+                renderSubredditFilter();
+                renderPosts();
+                
+                showToastMessage(`Removed r/${sub}`, 'success');
+            }
         );
-        safeSetItem('cachedPosts', cachedPosts);
-        
-        // Reset filter if we're filtering by the removed subreddit
-        if (activeFilter.toLowerCase() === sub.toLowerCase()) {
-            activeFilter = 'all';
-        }
-        
-        updateFeedTabsVisibility();
-        renderSubreddits();
-        renderSubredditFilter();
-        renderPosts();
     }
 
-    // Expose removeSubreddit globally for onclick handler
     window.removeSubreddit = removeSubreddit;
 
     // ============================================================================
@@ -704,7 +1174,6 @@
     function canMakeRequest() {
         const now = Date.now();
         
-        // Reset if past reset time
         if (now >= rateLimitState.resetTime) {
             rateLimitState.remainingRequests = CONFIG.REQUESTS_PER_MINUTE;
             rateLimitState.resetTime = now + CONFIG.RATE_LIMIT_RESET_INTERVAL;
@@ -724,19 +1193,9 @@
             if (delay > 0) {
                 await new Promise(resolve => setTimeout(resolve, delay));
             } else {
-                // Wait for rate limit reset
                 await new Promise(resolve => setTimeout(resolve, 1000));
             }
         }
-    }
-
-    async function exponentialBackoff(retryCount) {
-        const baseDelay = CONFIG.INITIAL_BACKOFF;
-        const exponentialDelay = baseDelay * Math.pow(2, retryCount);
-        const jitter = Math.random() * 1000;
-        const totalDelay = Math.min(exponentialDelay + jitter, CONFIG.MAX_BACKOFF);
-        
-        await new Promise(resolve => setTimeout(resolve, totalDelay));
     }
 
     function updateRateLimitFromHeaders(headers) {
@@ -750,7 +1209,7 @@
         }
 
         if (reset !== null) {
-            rateLimitState.resetTime = parseInt(reset, 10) * 1000; // Convert to milliseconds
+            rateLimitState.resetTime = parseInt(reset, 10) * 1000;
         }
 
         safeSetItem('rateLimitState', rateLimitState);
@@ -758,90 +1217,28 @@
     }
 
     // ============================================================================
-    // FETCH POSTS
+    // REFRESH POSTS - UPDATED
     // ============================================================================
-    async function fetchSubredditPosts(subreddit, retryCount = 0) {
-        await waitForRateLimit();
-
-        try {
-            const url = `https://www.reddit.com/r/${subreddit}.json?limit=${CONFIG.POSTS_LIMIT}&raw_json=1`;
-            const response = await fetch(url);
-
-            // Update rate limit state
-            rateLimitState.lastRequestTime = Date.now();
-            rateLimitState.remainingRequests = Math.max(0, rateLimitState.remainingRequests - 1);
-            rateLimitState.requestCount++;
-
-            updateRateLimitFromHeaders(response.headers);
-
-            if (response.status === 429) {
-                // Rate limit hit
-                if (retryCount < CONFIG.MAX_RETRIES) {
-                    await exponentialBackoff(retryCount);
-                    return fetchSubredditPosts(subreddit, retryCount + 1);
-                } else {
-                    throw new Error('Rate limit exceeded. Please wait and try again.');
-                }
-            }
-
-            if (!response.ok) {
-                throw new Error(`HTTP error! status: ${response.status}`);
-            }
-
-            const data = await response.json();
-            const posts = data.data.children.map(child => stripPostData(child.data));
-
-            safeSetItem('rateLimitState', rateLimitState);
-            updateAllDisplays();
-
-            return posts;
-        } catch (error) {
-            console.error(`Error fetching r/${subreddit}:`, error);
-            throw error;
-        }
-    }
-
-    async function fetchPosts() {
-        if (subreddits.length === 0) return;
-
+    function refreshPosts() {
         if (!navigator.onLine) {
-            alert('You are offline. Showing cached posts.');
+            showToastMessage('You are offline. Updates queued for when connection is restored.', 'info');
+            if (currentFeed === 'my') {
+                subreddits.forEach(sub => queueSyncJob('fetch_subreddit', sub));
+            } else if (currentFeed === 'popular') {
+                queueSyncJob('fetch_popular');
+            }
             return;
         }
-
-        // Clear status message while fetching
-        const status = document.getElementById('status');
-        if (status) status.textContent = '';
-
-        const statusDot = document.getElementById('statusDot');
-        if (statusDot) statusDot.className = 'status-dot loading';
-
-        const errors = [];
-
-        for (const sub of subreddits) {
-            try {
-                const posts = await fetchSubredditPosts(sub);
-                
-                if (posts.length > 0) {
-                    const allPosts = [...cachedPosts, ...posts];
-                    const uniquePosts = removeDuplicatePosts(allPosts);
-                    cachedPosts = uniquePosts.sort((a, b) => b.created_utc - a.created_utc);
-                    safeSetItem('cachedPosts', cachedPosts);
-                    
-                    // Check storage and cleanup if needed after each subreddit
-                    cleanupOldPosts();
-                }
-            } catch (error) {
-                errors.push(`r/${sub}: ${error.message}`);
-            }
-        }
         
-        if (errors.length > 0) {
-            errors.forEach(err => console.error(err));
+        toggleSidebar();
+        
+        if (currentFeed === 'my') {
+            subreddits.forEach(sub => queueSyncJob('fetch_subreddit', sub));
+            processSyncQueue();
+        } else if (currentFeed === 'popular') {
+            queueSyncJob('fetch_popular');
+            processSyncQueue();
         }
-
-        // Reload page to refresh everything
-        window.location.reload();
     }
 
     function removeDuplicatePosts(posts) {
@@ -856,7 +1253,6 @@
     }
 
     function stripPostData(post) {
-        // Keep only essential fields to save storage space
         const result = {
             id: post.id,
             title: post.title,
@@ -866,13 +1262,12 @@
             created_utc: post.created_utc,
             ups: post.ups,
             num_comments: post.num_comments,
-            selftext: post.selftext || '', // Keep full selftext
-            url: post.url || '', // External link or media URL
+            selftext: post.selftext || '',
+            url: post.url || '',
             is_video: post.is_video || false,
-            preview: null // We'll handle images separately
+            preview: null
         };
 
-        // Extract all gallery images if present
         if (post.gallery_data && post.media_metadata) {
             result.gallery = post.gallery_data.items.map(item => {
                 const media = post.media_metadata[item.media_id];
@@ -882,12 +1277,10 @@
                 return null;
             }).filter(Boolean);
         }
-        // Single image from preview
         else if (post.preview?.images?.[0]?.source?.url) {
             result.gallery = [post.preview.images[0].source.url.replace(/&amp;/g, '&')];
         }
 
-        // Add video URL if it's a video post
         if (post.is_video && post.media?.reddit_video?.fallback_url) {
             result.video_url = post.media.reddit_video.fallback_url;
         }
@@ -895,72 +1288,29 @@
         return result;
     }
 
-    function updateLoadingStatus(message) {
-        const status = document.getElementById('status');
-        status.textContent = `${message} (${rateLimitState.remainingRequests}/${CONFIG.REQUESTS_PER_MINUTE} requests remaining)`;
-    }
-
-    function refreshPosts() {
-        if (!navigator.onLine) {
-            alert('You are offline. Cannot refresh posts.');
-            return;
-        }
-        toggleSidebar(); // Close sidebar
-        
-        // Refresh current feed
-        if (currentFeed === 'my') {
-            fetchPosts();
-        } else {
-            fetchPopularPosts();
-        }
-    }
-
-    async function fetchPostsFromSubreddit(subreddit) {
-        if (!navigator.onLine) {
-            alert('You are offline. Cannot fetch posts.');
-            return;
-        }
-
-        const status = document.getElementById('status');
-        status.textContent = `Fetching posts from r/${subreddit}...`;
-
-        try {
-            const posts = await fetchSubredditPosts(subreddit);
-            
-            if (posts.length > 0) {
-                // Merge new posts with existing cached posts
-                const allPosts = [...cachedPosts, ...posts];
-                const uniquePosts = removeDuplicatePosts(allPosts);
-                cachedPosts = uniquePosts.sort((a, b) => b.created_utc - a.created_utc);
-                safeSetItem('cachedPosts', cachedPosts);
-            }
-            
-            status.textContent = '';
-        } catch (error) {
-            status.textContent = `Failed to fetch r/${subreddit}: ${error.message}`;
-            console.error(error);
-        }
-
-        renderPosts();
-    }
-
     // ============================================================================
-    // RENDER POSTS
+    // RENDER POSTS - UPDATED
     // ============================================================================
     function renderPosts() {
         const container = document.getElementById('posts');
         const status = document.getElementById('status');
 
-        let postsToShow = currentFeed === 'my' ? cachedPosts : popularPosts;
+        let postsToShow;
+        
+        if (currentFeed === 'my') {
+            postsToShow = cachedPosts;
+        } else if (currentFeed === 'popular') {
+            postsToShow = popularPosts;
+        } else if (currentFeed === 'starred') {
+            postsToShow = bookmarkedPosts;
+        }
 
-        // Filter by active subreddit filter (My Feed only) - case insensitive
         if (currentFeed === 'my' && activeFilter !== 'all') {
             postsToShow = postsToShow.filter(post => 
                 post.subreddit.toLowerCase() === activeFilter.toLowerCase()
             );
         }
 
-        // Filter out blocked subreddits (Popular feed only)
         if (currentFeed === 'popular') {
             postsToShow = postsToShow.filter(post => 
                 !blockedSubreddits.some(blocked => 
@@ -970,11 +1320,12 @@
         }
 
         if (postsToShow.length === 0) {
-            status.textContent = ''; // Clear top status
+            status.textContent = '';
             
-            // Show status as a post card
             let message = '';
-            if (currentFeed === 'my') {
+            if (currentFeed === 'starred') {
+                message = 'No starred posts yet. Tap the ★ icon on posts to save them here.';
+            } else if (currentFeed === 'my') {
                 message = navigator.onLine ? 
                     'No posts yet. Add subreddits and click "Refresh Posts".' : 
                     'No cached posts available. Connect to internet and refresh.';
@@ -1001,8 +1352,8 @@
     function createPostHTML(post) {
         const imageHtml = getImageHTML(post);
         const selftext = getSelftextHTML(post);
-
-        // Make subreddit clickable in both feeds
+        const isBookmarked = bookmarkedPosts.some(p => p.id === post.id);
+        
         const subredditHTML = `<span class="subreddit-name" onclick="window.openSubredditPopup('${escapeHTML(post.subreddit)}')">r/${escapeHTML(post.subreddit)}</span>`;
 
         return `
@@ -1011,6 +1362,11 @@
                     ${subredditHTML}
                     • Posted by <span class="post-author">u/${escapeHTML(post.author)}</span>
                     • ${formatTime(post.created_utc)}
+                    <button class="bookmark-btn ${isBookmarked ? 'bookmarked' : ''}" 
+                            onclick="window.toggleBookmark('${post.id}')" 
+                            title="${isBookmarked ? 'Remove from starred' : 'Add to starred'}">
+                        ${isBookmarked ? '★' : '☆'}
+                    </button>
                 </div>
                 <div class="post-title">
                     <a href="https://reddit.com${escapeHTML(post.permalink)}" target="_blank" rel="noopener noreferrer">
@@ -1028,34 +1384,38 @@
     }
 
     function getImageHTML(post) {
-        // Handle video posts
         if (post.is_video && post.video_url) {
-            return `<video class="post-image" controls><source src="${escapeHTML(post.video_url)}" type="video/mp4">Your browser does not support video.</video>`;
+            return `<video class="post-image" controls preload="metadata"><source src="${escapeHTML(post.video_url)}" type="video/mp4">Your browser does not support video.</video>`;
         }
 
-        // Handle image gallery (single or multiple images)
         if (post.gallery && post.gallery.length > 0) {
             if (post.gallery.length === 1) {
-                // Single image - no gallery controls needed
                 return `<img class="post-image" src="${escapeHTML(post.gallery[0])}" alt="" loading="lazy" />`;
             }
             
-            // Multiple images - create gallery
             const galleryId = `gallery-${post.id}`;
+            
             const images = post.gallery.map((url, index) => 
-                `<img class="post-gallery-image ${index === 0 ? 'active' : ''}" src="${escapeHTML(url)}" alt="" loading="lazy" />`
+                `<img class="post-gallery-image ${index === 0 ? 'active' : ''} ${index > 0 ? 'preloading' : ''}" 
+                     src="${escapeHTML(url)}" 
+                     alt="" 
+                     data-index="${index}"
+                     onload="this.classList.remove('preloading'); this.classList.add('loaded');" />`
             ).join('');
             
             const dots = post.gallery.map((_, index) => 
-                `<span class="gallery-dot ${index === 0 ? 'active' : ''}" onclick="window.setGalleryImage('${galleryId}', ${index})"></span>`
+                `<span class="gallery-dot ${index === 0 ? 'active' : ''}" data-index="${index}"></span>`
             ).join('');
             
             return `
-                <div class="post-gallery" id="${galleryId}">
-                    ${images}
-                    <button class="gallery-nav prev" onclick="window.prevGalleryImage('${galleryId}')" aria-label="Previous">‹</button>
-                    <button class="gallery-nav next" onclick="window.nextGalleryImage('${galleryId}')" aria-label="Next">›</button>
+                <div class="post-gallery" id="${galleryId}" data-current="0">
+                    <div class="gallery-container">
+                        ${images}
+                    </div>
+                    <button class="gallery-nav prev" aria-label="Previous">‹</button>
+                    <button class="gallery-nav next" aria-label="Next">›</button>
                     <div class="gallery-indicators">${dots}</div>
+                    <div class="gallery-counter">1 / ${post.gallery.length}</div>
                 </div>
             `;
         }
@@ -1068,30 +1428,26 @@
             return '';
         }
 
-        let text = post.selftext; // Show full text, no truncation
+        let text = post.selftext;
         
-        // Convert markdown links [text](url) to HTML links before escaping
         const parts = [];
         let lastIndex = 0;
         const linkRegex = /\[([^\]]+)\]\(([^\)]+)\)/g;
         let match;
         
         while ((match = linkRegex.exec(text)) !== null) {
-            // Add text before the link (escaped)
             if (match.index > lastIndex) {
                 parts.push(escapeHTML(text.substring(lastIndex, match.index)));
             }
-            // Add the link
             parts.push(`<a href="${escapeHTML(match[2])}" target="_blank" rel="noopener noreferrer">${escapeHTML(match[1])}</a>`);
             lastIndex = match.index + match[0].length;
         }
         
-        // Add remaining text after last link (escaped)
         if (lastIndex < text.length) {
             parts.push(escapeHTML(text.substring(lastIndex)));
         }
         
-        const html = parts.join('').replace(/\n/g, '<br>'); // Preserve line breaks
+        const html = parts.join('').replace(/\n/g, '<br>');
         return `<div class="post-text">${html}</div>`;
     }
 
@@ -1108,13 +1464,12 @@
         const now = Date.now() / 1000;
         const diff = now - timestamp;
         
-        if (diff < 0) return 'just now'; // Handle future dates
+        if (diff < 0) return 'just now';
         if (diff < 60) return `${Math.floor(diff)}s ago`;
         if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
         if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
         if (diff < 2592000) return `${Math.floor(diff / 86400)}d ago`;
         
-        // For older posts, show actual date
         const date = new Date(timestamp * 1000);
         return date.toLocaleDateString();
     }
@@ -1142,7 +1497,6 @@
             const total = CONFIG.REQUESTS_PER_MINUTE;
             rateLimitInfo.textContent = `${remaining}/${total}`;
             
-            // Change color based on remaining requests
             if (remaining <= 2) {
                 rateLimitInfo.style.background = 'rgba(244, 67, 54, 0.8)';
             } else if (remaining <= 5) {
@@ -1195,6 +1549,8 @@
         a.click();
         document.body.removeChild(a);
         URL.revokeObjectURL(url);
+        
+        showToastMessage('Subreddits exported!', 'success');
     }
 
     function importSubreddits(event) {
@@ -1207,19 +1563,15 @@
                 const data = JSON.parse(e.target.result);
                 
                 if (!data.subreddits || !Array.isArray(data.subreddits)) {
-                    alert('Invalid file format');
+                    showToastMessage('Invalid file format', 'error');
                     return;
                 }
 
-                const beforeCount = subreddits.length;
-                
-                // Normalize to lowercase for comparison
                 const normalizedExisting = subreddits.map(s => s.toLowerCase());
                 const newSubs = data.subreddits.filter(sub => 
                     !normalizedExisting.includes(sub.toLowerCase())
                 );
                 
-                // Add new subreddits
                 subreddits = [...subreddits, ...newSubs];
                 safeSetItem('subreddits', subreddits);
                 
@@ -1229,18 +1581,17 @@
                 renderSubredditFilter();
                 updateFeedTabsVisibility();
                 
-                alert(`Imported ${data.subreddits.length} subreddits (${newCount} new)`);
+                showToastMessage(`Imported ${data.subreddits.length} subreddits (${newCount} new)`, 'success');
                 
-                // Close sidebar and fetch new posts if any were added
                 if (newCount > 0) {
                     toggleSidebar();
-                    fetchPosts();
+                    newSubs.forEach(sub => queueSyncJob('fetch_subreddit', sub));
+                    processSyncQueue();
                 }
                 
-                // Clear file input
                 event.target.value = '';
             } catch (error) {
-                alert('Error reading file: ' + error.message);
+                showToastMessage('Error reading file: ' + error.message, 'error');
             }
         };
         reader.readAsText(file);
@@ -1266,7 +1617,6 @@
         
         if (!welcomeScreen || !countryList) return;
 
-        // Render country options
         countryList.innerHTML = countrySuggestions.map((country, index) => `
             <div class="country-option" data-index="${index}">
                 <div class="country-option-name">${country.name}</div>
@@ -1274,7 +1624,6 @@
             </div>
         `).join('');
 
-        // Add click handlers to country options
         countryList.querySelectorAll('.country-option').forEach(option => {
             option.addEventListener('click', () => selectCountry(option));
         });
@@ -1283,16 +1632,13 @@
     }
 
     function selectCountry(optionElement) {
-        // Remove selection from all options
         document.querySelectorAll('.country-option').forEach(opt => {
             opt.classList.remove('selected');
         });
 
-        // Select clicked option
         optionElement.classList.add('selected');
         selectedCountry = parseInt(optionElement.dataset.index);
 
-        // Enable add defaults button
         const addDefaultsBtn = document.getElementById('addDefaults');
         if (addDefaultsBtn) addDefaultsBtn.disabled = false;
     }
@@ -1308,7 +1654,10 @@
         updateFeedTabsVisibility();
         renderSubreddits();
         renderSubredditFilter();
-        fetchPosts();
+        
+        // Queue fetch for default subreddits
+        subreddits.forEach(sub => queueSyncJob('fetch_subreddit', sub));
+        processSyncQueue();
     }
 
     function hideWelcomeScreen() {
@@ -1317,14 +1666,13 @@
             welcomeScreen.classList.remove('active');
         }
         
-        // If still no subreddits after skip, render the empty state
         renderSubreddits();
         renderPosts();
         updateAllDisplays();
     }
 
     // ============================================================================
-    // STORAGE MANAGEMENT
+    // STORAGE MANAGEMENT - UPDATED
     // ============================================================================
     function getLocalStorageSize() {
         let total = 0;
@@ -1333,13 +1681,12 @@
                 total += localStorage[key].length + key.length;
             }
         }
-        return total * 2; // Characters are 2 bytes in UTF-16
+        return total * 2;
     }
 
     function getStorageUsagePercent() {
         const size = getLocalStorageSize();
-        const limit = 5 * 1024 * 1024; // 5MB conservative estimate
-        return (size / limit) * 100;
+        return (size / storageQuota) * 100;
     }
 
     function formatBytes(bytes) {
@@ -1348,9 +1695,8 @@
         return (bytes / (1024 * 1024)).toFixed(2) + ' MB';
     }
 
-    function updateStorageStats() {
+    async function updateStorageStats() {
         const size = getLocalStorageSize();
-        const limit = 5 * 1024 * 1024;
         const percent = getStorageUsagePercent();
 
         const usageEl = document.getElementById('storageUsage');
@@ -1359,12 +1705,11 @@
         const postsPerSubEl = document.getElementById('postsPerSub');
 
         if (usageEl) {
-            usageEl.textContent = `${formatBytes(size)} / ${formatBytes(limit)}`;
+            usageEl.textContent = `${formatBytes(size)} / ${formatBytes(storageQuota)}`;
         }
 
         if (barEl) {
             barEl.style.width = `${Math.min(percent, 100)}%`;
-            // Change color based on usage
             if (percent >= 90) {
                 barEl.style.background = '#f44336';
             } else if (percent >= 80) {
@@ -1375,26 +1720,29 @@
         }
 
         if (totalPostsEl) {
-            totalPostsEl.textContent = cachedPosts.length + popularPosts.length;
+            const totalCached = cachedPosts.length + popularPosts.length;
+            const totalStarred = bookmarkedPosts.length;
+            totalPostsEl.textContent = `${totalCached} cached + ${totalStarred} starred`;
         }
 
-        // Posts per subreddit breakdown
         if (postsPerSubEl) {
             const breakdown = {};
             
-            // Count posts from My Feed by subreddit
             cachedPosts.forEach(post => {
                 breakdown[post.subreddit] = (breakdown[post.subreddit] || 0) + 1;
             });
             
-            // Count all popular posts as single entry
             if (popularPosts.length > 0) {
                 breakdown['popular'] = popularPosts.length;
+            }
+            
+            if (bookmarkedPosts.length > 0) {
+                breakdown['★ starred'] = bookmarkedPosts.length;
             }
 
             const lines = Object.entries(breakdown)
                 .sort((a, b) => b[1] - a[1])
-                .map(([sub, count]) => `r/${sub}: ${count}`)
+                .map(([sub, count]) => `${sub.startsWith('★') ? sub : 'r/' + sub}: ${count}`)
                 .join('<br>');
 
             postsPerSubEl.innerHTML = lines || '<em>No posts cached</em>';
@@ -1405,45 +1753,48 @@
         const usagePercent = getStorageUsagePercent();
         
         if (usagePercent < 80) {
-            return; // No cleanup needed
+            return;
         }
 
         console.log(`Storage at ${usagePercent.toFixed(1)}% - cleaning up old posts`);
 
-        // Sort all posts by age (oldest first)
-        const allPosts = [...cachedPosts, ...popularPosts];
+        const bookmarkedIds = new Set(bookmarkedPosts.map(p => p.id));
+
+        const allPosts = [...cachedPosts, ...popularPosts].filter(p => !bookmarkedIds.has(p.id));
         const sortedByAge = allPosts.sort((a, b) => a.created_utc - b.created_utc);
 
-        // Calculate how many posts to remove (remove oldest 20% of posts)
         const removeCount = Math.ceil(sortedByAge.length * 0.2);
         const postsToRemove = sortedByAge.slice(0, removeCount);
         const removeIds = new Set(postsToRemove.map(p => p.id));
 
-        // Remove from cached posts
         cachedPosts = cachedPosts.filter(post => !removeIds.has(post.id));
         safeSetItem('cachedPosts', cachedPosts);
 
-        // Remove from popular posts
         popularPosts = popularPosts.filter(post => !removeIds.has(post.id));
         safeSetItem('popularPosts', popularPosts);
 
-        console.log(`Removed ${removeCount} oldest posts. New storage: ${getStorageUsagePercent().toFixed(1)}%`);
+        console.log(`Removed ${removeCount} oldest posts. Bookmarked posts: ${bookmarkedPosts.length} protected.`);
     }
 
     // ============================================================================
-    // PERIODIC TASKS
+    // PERIODIC TASKS - FIXED
     // ============================================================================
     function setupPeriodicTasks() {
+        // Clear existing intervals
+        if (displayUpdateInterval) clearInterval(displayUpdateInterval);
+        if (updateCheckInterval) clearInterval(updateCheckInterval);
+        if (rateLimitResetInterval) clearInterval(rateLimitResetInterval);
+        
         // Update displays every 10 seconds
-        setInterval(updateAllDisplays, 10000);
+        displayUpdateInterval = setInterval(updateAllDisplays, 10000);
 
         // Check for updates every 5 minutes
         if ('serviceWorker' in navigator) {
             updateCheckInterval = setInterval(checkForUpdates, CONFIG.UPDATE_CHECK_INTERVAL);
         }
 
-        // Reset rate limit (conservative approach)
-        setInterval(() => {
+        // Reset rate limit
+        rateLimitResetInterval = setInterval(() => {
             const now = Date.now();
             if (now >= rateLimitState.resetTime) {
                 rateLimitState.remainingRequests = CONFIG.REQUESTS_PER_MINUTE;
@@ -1452,8 +1803,15 @@
                 safeSetItem('rateLimitState', rateLimitState);
                 updateAllDisplays();
             }
-        }, 10000); // Check every 10 seconds
+        }, 10000);
     }
+
+    // Clean up on page unload
+    window.addEventListener('beforeunload', () => {
+        if (displayUpdateInterval) clearInterval(displayUpdateInterval);
+        if (updateCheckInterval) clearInterval(updateCheckInterval);
+        if (rateLimitResetInterval) clearInterval(rateLimitResetInterval);
+    });
 
     // ============================================================================
     // START APPLICATION
